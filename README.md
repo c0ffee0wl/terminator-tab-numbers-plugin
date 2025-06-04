@@ -41,6 +41,7 @@ Terminal 1    user@host: ~/projects    My Custom Tab
    Or copy the content of `tab_numbers.py` to `~/.config/terminator/plugins/tab_numbers.py`
 
 3. **Enable the plugin**:
+   - Close and restart Terminator
    - Right-click in Terminator → Preferences → Plugins
    - Check "TabNumbers" in the plugin list
    - Click "Close"
