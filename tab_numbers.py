@@ -42,7 +42,7 @@ class TabNumbers(plugin.Plugin):
                 self.process_window(window)
             
             # Keep original timer frequency for reliability
-            GObject.timeout_add(10, self.periodic_check)
+            GObject.timeout_add(500, self.periodic_check)
             
             dbg('TabNumbers plugin initialized successfully')
         except Exception as e:
