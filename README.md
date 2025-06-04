@@ -49,7 +49,7 @@ Terminal 1    user@host: ~/projects    My Custom Tab
 
 ```bash
 git clone https://github.com/c0ffee0wl/terminator-tab-numbers-plugin.git
-cd terminator-tab-numbers
+cd terminator-tab-numbers-plugin
 cp tab_numbers.py ~/.config/terminator/plugins/tab_numbers.py
 ```
 
@@ -117,6 +117,7 @@ new_text = "(%d) %s" % (i + 1, clean_text)    # (1) Title
 - Very rapid tab operations (>10 tabs/second) may cause brief display delays
 - Memory usage grows slightly over very long sessions (weeks)
 - Not compatible with Terminator versions < 1.90
+
 
 ## License
 
