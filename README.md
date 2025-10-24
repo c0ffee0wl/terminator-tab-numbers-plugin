@@ -75,15 +75,21 @@ With numbered tabs, you can easily use Terminator's built-in shortcuts:
 The plugin works out of the box with no configuration required. However, you can modify the source code for customization:
 
 ### Change Number Format
-```python
-# In update_tab_numbers method, change this line:
-new_text = "%d: %s" % (i + 1, clean_text)
 
-# Examples:
-new_text = "[%d] %s" % (i + 1, clean_text)    # [1] Title
-new_text = "%d. %s" % (i + 1, clean_text)     # 1. Title  
-new_text = "(%d) %s" % (i + 1, clean_text)    # (1) Title
+To change how tab numbers are displayed, edit `tab_numbers.py` and modify the numbering format in the `numbered_set_text` wrapper function (around line 162):
+
+```python
+# Find this line in the numbered_set_text function:
+text = "%d: %s" % (page_index + 1, clean_text)
+
+# Change it to your preferred format:
+text = "[%d] %s" % (page_index + 1, clean_text)    # [1] Title
+text = "%d. %s" % (page_index + 1, clean_text)     # 1. Title
+text = "(%d) %s" % (page_index + 1, clean_text)    # (1) Title
+text = "Tab %d: %s" % (page_index + 1, clean_text) # Tab 1: Title
 ```
+
+**Note**: After modifying the file, restart Terminator for changes to take effect.
 
 ## Troubleshooting
 
@@ -96,12 +102,11 @@ new_text = "(%d) %s" % (i + 1, clean_text)    # (1) Title
 ### Numbers Not Updating
 1. Check debug output: Run `terminator -d` to see plugin messages
 2. Verify plugin is enabled in Preferences → Plugins
-3. Try the minimal optimized version if issues persist
+3. Restart Terminator completely to reload the plugin
 
 ### Performance Issues
-1. Use `tab_numbers_minimal_optimized.py` for better performance
-2. Adjust timer frequency (see Configuration section)
-3. Monitor with `htop` or similar tools
+1. Monitor with `htop` or similar tools if you experience issues
+2. Check debug output with `terminator -d` to identify bottlenecks
 
 
 ### Contributing
