@@ -17,302 +17,200 @@
 #
 # Displays the current tab number in the title of each tab
 
+import re
 import terminatorlib.plugin as plugin
 from terminatorlib.terminator import Terminator
-from terminatorlib.factory import Factory
 from gi.repository import GObject
 from terminatorlib.util import dbg, err
-import re
 
-# Every plugin you want Terminator to load *must* be listed in 'AVAILABLE'
 AVAILABLE = ['TabNumbers']
+
+# Keep these paired — the regex must strip whatever NUMBER_FORMAT produces.
+NUMBER_FORMAT = "%d: %s"
+NUMBER_PREFIX_RE = re.compile(r'^\d+:\s*')
+assert NUMBER_PREFIX_RE.match(NUMBER_FORMAT % (1, '')), \
+    "NUMBER_FORMAT and NUMBER_PREFIX_RE have drifted"
+
+_NOTEBOOK_SIGNALS = ('page-added', 'page-removed', 'page-reordered')
+
+
+def _strip_prefix(text):
+    if not text:
+        return ""
+    return NUMBER_PREFIX_RE.sub('', text)
+
+
+def _iter_tab_labels(notebook):
+    """Yield (page, editable_label) for each numberable tab in the notebook."""
+    for i in range(notebook.get_n_pages()):
+        page = notebook.get_nth_page(i)
+        if not page:
+            continue
+        tab_label = notebook.get_tab_label(page)
+        if tab_label and hasattr(tab_label, 'label'):
+            yield page, tab_label.label
+
 
 class TabNumbers(plugin.Plugin):
     """Plugin to display tab numbers in tab titles"""
     capabilities = ['tab_numbers']
-    
+
     def __init__(self):
-        """Initialize the plugin"""
         plugin.Plugin.__init__(self)
-        dbg('TabNumbers plugin initializing...')
-        
-        # Cache regex pattern and factory for performance
-        self._number_prefix_pattern = re.compile(r'^\d+:\s*')
-        self._factory = Factory()
-        
-        # Track processed notebooks to avoid duplicate signal connections
-        self._processed_notebooks = set()
-
-        # Track wrapped EditableLabels to avoid double-wrapping
-        self._wrapped_editablelabels = set()
-
-        # Use idle_add to ensure Terminator is fully initialized
+        self.terminator = None
+        self._original_register_window = None
+        # Terminator's singleton and windows aren't ready during plugin init;
+        # idle_add defers setup until after the GTK main loop is running.
         GObject.idle_add(self.delayed_init)
-    
+
     def delayed_init(self):
-        """Initialize the plugin after Terminator is ready"""
         try:
             self.terminator = Terminator()
-            dbg('TabNumbers: Terminator instance obtained')
-            
-            # Process existing windows
+
+            # Terminator exposes no window-added signal, so wrap register_window
+            # to catch new windows without polling.
+            self._original_register_window = self.terminator.register_window
+            original = self._original_register_window
+
+            def wrapped_register_window(window):
+                original(window)
+                try:
+                    self.process_window(window)
+                except Exception as e:
+                    err('TabNumbers: Error processing new window: %s' % e)
+
+            self.terminator.register_window = wrapped_register_window
+
             for window in self.terminator.windows:
                 self.process_window(window)
-
-            dbg('TabNumbers plugin initialized successfully')
+            dbg('TabNumbers plugin initialized')
         except Exception as e:
             err('TabNumbers: Error in delayed_init: %s' % e)
-        
-        return False  # Don't repeat this idle callback
+        return False  # don't repeat this idle callback
 
     def process_window(self, window):
-        """Process a window to find and connect to notebooks"""
-        try:
-            notebooks = self.find_notebooks_in_widget(window)
-
-            for notebook in notebooks:
-                self.setup_notebook(notebook)
-        except Exception as e:
-            err('TabNumbers: Error processing window: %s' % e)
+        # A Terminator Window's direct child is either a Terminal or a Notebook.
+        if hasattr(window, 'is_child_notebook') and window.is_child_notebook():
+            self.setup_notebook(window.get_child())
 
     def check_for_new_windows(self):
-        """Check for new windows and process them (lightweight operation)"""
-        try:
-            for window in self.terminator.windows:
-                self.process_window(window)
-        except Exception as e:
-            err('TabNumbers: Error checking for new windows: %s' % e)
+        # Fallback for the transition where a naked single-Terminal window
+        # gains a Notebook on its first-tab creation — register_window is not
+        # re-invoked for that transition. Only wired to the low-frequency
+        # on_tab_event handler, not to every tab switch.
+        if self.terminator is None:
+            return
+        for window in self.terminator.windows:
+            self.process_window(window)
 
     def setup_notebook(self, notebook):
-        """Set up a notebook for tab numbering"""
-        try:
-            # Use object id for tracking to avoid memory leaks
-            notebook_id = id(notebook)
-            
-            # Check if we've already processed this notebook
-            if notebook_id not in self._processed_notebooks:
-                # Connect to notebook signals for immediate response
-                notebook.connect('page-added', self.on_tab_event)
-                notebook.connect('page-removed', self.on_tab_event)
-                notebook.connect('page-reordered', self.on_tab_event)
-                notebook.connect('switch-page', self.on_tab_switch)
-                
-                # Mark as processed
-                self._processed_notebooks.add(notebook_id)
-                dbg('TabNumbers: Connected to notebook signals')
-            
-            # Wrap tab labels for existing tabs to intercept all label updates
-            self.wrap_tab_labels(notebook)
-        except Exception as e:
-            err('TabNumbers: Error setting up notebook: %s' % e)
-    
+        # Skip wrap/renumber on re-entry: the on_tab_event path handles new
+        # tabs on already-wired notebooks directly. This keeps
+        # check_for_new_windows a cheap O(W) walk that only does work for
+        # newly-appeared notebooks.
+        if hasattr(notebook, '_tabnumbers_handler_ids'):
+            return
+        notebook._tabnumbers_handler_ids = [
+            notebook.connect(sig, self.on_tab_event)
+            for sig in _NOTEBOOK_SIGNALS
+        ]
+        dbg('TabNumbers: Connected to notebook signals')
+        self.wrap_tab_labels(notebook)
+        self.renumber_all_tabs(notebook)
+
     def wrap_tab_labels(self, notebook):
-        """Wrap EditableLabel.set_text() methods to automatically add tab numbers"""
-        try:
-            num_pages = notebook.get_n_pages()
+        for page, editable_label in _iter_tab_labels(notebook):
+            self.wrap_editablelabel_set_text(editable_label, page, notebook)
 
-            for i in range(num_pages):
-                page = notebook.get_nth_page(i)
-                if page:
-                    tab_label = notebook.get_tab_label(page)
-                    if tab_label and hasattr(tab_label, 'label'):
-                        self.wrap_editablelabel_set_text(tab_label, notebook)
-        except Exception as e:
-            err('TabNumbers: Error wrapping tab labels: %s' % e)
+    def wrap_editablelabel_set_text(self, editable_label, page, notebook):
+        if hasattr(editable_label, '_tabnumbers_original_set_text'):
+            return
 
-    def wrap_editablelabel_set_text(self, tab_label, notebook):
-        """Wrap a single EditableLabel.set_text() method to add numbering"""
-        try:
-            editable_label = tab_label.label
+        original_set_text = editable_label.set_text
+        editable_label._tabnumbers_original_set_text = original_set_text
 
-            # Use object id for tracking to avoid memory leaks
-            editablelabel_id = id(editable_label)
+        # Closure captures `page` so page_num() is an O(1) C-level lookup
+        # instead of a per-update Python scan of every tab.
+        def numbered_set_text(text, force=False):
+            raw_text = text if text else ""
+            try:
+                page_index = notebook.page_num(page)
+                if page_index < 0:
+                    return original_set_text(raw_text, force=force)
+                numbered = NUMBER_FORMAT % (page_index + 1, _strip_prefix(raw_text))
+                # Skip the GTK property set + Pango relayout when unchanged.
+                if numbered == editable_label.get_text():
+                    return None
+                return original_set_text(numbered, force=force)
+            except Exception as e:
+                err('TabNumbers: Error in wrapped set_text: %s' % e)
+                return original_set_text(raw_text, force=force)
 
-            # Check if already wrapped
-            if editablelabel_id in self._wrapped_editablelabels:
-                return
+        editable_label.set_text = numbered_set_text
 
-            # Save original method on the EditableLabel itself for edit-done handler to use
-            original_set_text = editable_label.set_text
-            editable_label._tabnumbers_original_set_text = original_set_text
-
-            # Create wrapper function
-            def numbered_set_text(text, force=False):
-                """Wrapper that automatically adds tab number prefix"""
-                try:
-                    # Validate input
-                    if not text:
-                        text = ""
-
-                    # Find current page index for this tab_label
-                    num_pages = notebook.get_n_pages()
-                    page_index = -1
-
-                    for i in range(num_pages):
-                        page = notebook.get_nth_page(i)
-                        if page and notebook.get_tab_label(page) == tab_label:
-                            page_index = i
-                            break
-
-                    # If we found the page, add numbering
-                    if page_index >= 0:
-                        # Strip existing number prefix
-                        clean_text = self.remove_number_prefix(text)
-                        # Add correct number prefix
-                        text = "%d: %s" % (page_index + 1, clean_text)
-                        dbg('TabNumbers: Wrapped set_text called for tab %d: "%s"' % (page_index + 1, text))
-
-                    # Call original method
-                    return original_set_text(text, force=force)
-                except Exception as e:
-                    err('TabNumbers: Error in wrapped set_text: %s' % e)
-                    # Fallback to original method on error
-                    return original_set_text(text, force=force)
-
-            # Replace method with wrapper
-            editable_label.set_text = numbered_set_text
-
-            # Mark as wrapped
-            self._wrapped_editablelabels.add(editablelabel_id)
-            dbg('TabNumbers: Wrapped set_text for EditableLabel')
-
-            # Also connect to edit-done signal if not already connected
-            if not hasattr(editable_label, '_tabnumbers_edit_connected'):
-                editable_label.connect('edit-done', self.on_tab_label_edited, notebook, tab_label)
-                editable_label._tabnumbers_edit_connected = True
-                dbg('TabNumbers: Connected to tab label edit-done signal')
-
-            # Trigger initial numbering for this tab
-            current_text = editable_label.get_text()
-            if current_text:
-                # Use the wrapper to add numbers
-                numbered_set_text(current_text, force=True)
-        except Exception as e:
-            err('TabNumbers: Error wrapping EditableLabel.set_text: %s' % e)
+        handler_id = editable_label.connect('edit-done', self.on_tab_label_edited)
+        editable_label._tabnumbers_edit_handler = handler_id
+        dbg('TabNumbers: Wrapped set_text for EditableLabel')
 
     def on_tab_event(self, notebook, *args):
-        """Handle tab events (add, remove, reorder)"""
-        # Wrap any new tab labels
-        self.wrap_tab_labels(notebook)
-        # Force renumbering of all existing tabs
-        self.renumber_all_tabs(notebook)
-        # Check for new windows (lightweight, handles new Terminator windows)
-        self.check_for_new_windows()
-    
-    def renumber_all_tabs(self, notebook):
-        """Force renumbering of all tabs in the notebook"""
         try:
-            num_pages = notebook.get_n_pages()
-            dbg('TabNumbers: Renumbering %d tabs' % num_pages)
-
-            for i in range(num_pages):
-                page = notebook.get_nth_page(i)
-                if not page:
-                    continue
-
-                tab_label = notebook.get_tab_label(page)
-                if not tab_label or not hasattr(tab_label, 'label'):
-                    continue
-
-                editable_label = tab_label.label
-
-                # Get current text and strip existing number
-                current_text = editable_label.get_text()
-                clean_text = self.remove_number_prefix(current_text)
-
-                # Use the original unwrapped set_text to update with correct number
-                # This triggers the wrapper which will add the correct number
-                if hasattr(editable_label, '_tabnumbers_original_set_text'):
-                    # Force the update by calling the wrapper through the current set_text
-                    editable_label.set_text(clean_text, force=True)
-                    dbg('TabNumbers: Renumbered tab %d to: "%d: %s"' % (i, i + 1, clean_text))
-        except Exception as e:
-            err('TabNumbers: Error renumbering tabs: %s' % e)
-
-    def on_tab_switch(self, notebook, page, page_num, *args):
-        """Handle tab switch events"""
-        # Check for new windows (lightweight, handles new Terminator windows)
-        self.check_for_new_windows()
-
-    def on_tab_label_edited(self, editable_label, notebook, tab_label):
-        """Handle tab label edit-done events"""
-        try:
-            # Get the edited text from the EditableLabel
-            current_text = editable_label.get_text()
-
-            # Find which tab this label belongs to
-            num_pages = notebook.get_n_pages()
-            page_index = -1
-
-            for i in range(num_pages):
-                page = notebook.get_nth_page(i)
-                if page and notebook.get_tab_label(page) == tab_label:
-                    page_index = i
-                    break
-
-            # If we found the tab, update with correct number
-            if page_index >= 0:
-                # Remove existing number prefix
-                clean_text = self.remove_number_prefix(current_text)
-                # Add correct number prefix
-                numbered_text = "%d: %s" % (page_index + 1, clean_text)
-
-                # Use the original unwrapped set_text to avoid double-processing
-                if hasattr(editable_label, '_tabnumbers_original_set_text'):
-                    editable_label._tabnumbers_original_set_text(numbered_text, force=True)
-                else:
-                    # Fallback if original not stored (shouldn't happen)
-                    editable_label.set_text(numbered_text, force=True)
-
-                dbg('TabNumbers: Re-added number after edit for tab %d: "%s"' % (page_index + 1, numbered_text))
-
-            # Check for new windows (lightweight, handles new Terminator windows)
+            self.wrap_tab_labels(notebook)
+            self.renumber_all_tabs(notebook)
             self.check_for_new_windows()
         except Exception as e:
-            err('TabNumbers: Error in on_tab_label_edited: %s' % e)
-    
-    def find_notebooks_in_widget(self, widget):
-        """Recursively find all notebook widgets"""
-        notebooks = []
-        
+            err('TabNumbers: Error in on_tab_event: %s' % e)
+
+    def renumber_all_tabs(self, notebook):
+        dbg('TabNumbers: Renumbering %d tabs' % notebook.get_n_pages())
+        for _page, editable_label in _iter_tab_labels(notebook):
+            # The wrapper strips and re-applies the correct prefix; force=True
+            # overrides EditableLabel's _custom flag so user-edited tabs also
+            # get renumbered when their position changes.
+            editable_label.set_text(editable_label.get_text(), force=True)
+
+    def on_tab_label_edited(self, editable_label):
         try:
-            # Use cached factory instance
-            if self._factory.isinstance(widget, 'Notebook'):
-                notebooks.append(widget)
-            
-            # Check children
-            if hasattr(widget, 'get_children'):
-                for child in widget.get_children():
-                    notebooks.extend(self.find_notebooks_in_widget(child))
-            elif hasattr(widget, 'get_child'):
-                child = widget.get_child()
-                if child:  # Check if child exists before recursing
-                    notebooks.extend(self.find_notebooks_in_widget(child))
+            # User edits reach the inner Gtk.Label directly via
+            # EditableLabel._on_entry_activated, bypassing the wrapper. Re-run
+            # set_text so the wrapper re-applies the number prefix.
+            editable_label.set_text(editable_label.get_text(), force=True)
         except Exception as e:
-            err('TabNumbers: Error finding notebooks: %s' % e)
-            
-        return notebooks
-    
-    def remove_number_prefix(self, text):
-        """Remove existing number prefix from tab title"""
-        if not text:
-            return ""
-        # Use cached regex pattern for performance
-        return self._number_prefix_pattern.sub('', text)
-    
-    def cleanup_destroyed_notebooks(self):
-        """Clean up references to destroyed notebooks"""
-        # This could be called periodically if memory usage becomes an issue
-        # For now, we rely on Python's garbage collection
-        pass
-    
+            err('TabNumbers: Error in on_tab_label_edited: %s' % e)
+
     def unload(self):
-        """Clean up when plugin is unloaded"""
         try:
-            # Clear tracking sets
-            self._processed_notebooks.clear()
-            self._wrapped_editablelabels.clear()
+            if self.terminator is not None:
+                if self._original_register_window is not None:
+                    self.terminator.register_window = self._original_register_window
+                    self._original_register_window = None
+                for window in self.terminator.windows:
+                    self._unwrap_window(window)
             dbg('TabNumbers plugin unloaded')
         except Exception as e:
             err('TabNumbers: Error during unload: %s' % e)
 
+    def _unwrap_window(self, window):
+        if not (hasattr(window, 'is_child_notebook') and window.is_child_notebook()):
+            return
+        notebook = window.get_child()
+        handler_ids = getattr(notebook, '_tabnumbers_handler_ids', None)
+        if handler_ids:
+            for hid in handler_ids:
+                try:
+                    notebook.disconnect(hid)
+                except Exception:
+                    pass
+            del notebook._tabnumbers_handler_ids
+        for _page, editable_label in _iter_tab_labels(notebook):
+            original = getattr(editable_label, '_tabnumbers_original_set_text', None)
+            if original is None:
+                continue
+            handler_id = getattr(editable_label, '_tabnumbers_edit_handler', None)
+            if handler_id is not None:
+                try:
+                    editable_label.disconnect(handler_id)
+                except Exception:
+                    pass
+                del editable_label._tabnumbers_edit_handler
+            editable_label.set_text = original
+            del editable_label._tabnumbers_original_set_text
