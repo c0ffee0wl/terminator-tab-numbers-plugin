@@ -18,6 +18,7 @@
 # Displays the current tab number in the title of each tab
 
 import re
+import traceback
 import terminatorlib.plugin as plugin
 from terminatorlib.terminator import Terminator
 from gi.repository import GObject
@@ -28,16 +29,23 @@ AVAILABLE = ['TabNumbers']
 # Keep these paired — the regex must strip whatever NUMBER_FORMAT produces.
 NUMBER_FORMAT = "%d: %s"
 NUMBER_PREFIX_RE = re.compile(r'^\d+:\s*')
-assert NUMBER_PREFIX_RE.match(NUMBER_FORMAT % (1, '')), \
-    "NUMBER_FORMAT and NUMBER_PREFIX_RE have drifted"
+if not NUMBER_PREFIX_RE.match(NUMBER_FORMAT % (1, '')):
+    raise RuntimeError("NUMBER_FORMAT and NUMBER_PREFIX_RE have drifted")
 
 _NOTEBOOK_SIGNALS = ('page-added', 'page-removed', 'page-reordered')
 
+_NOTEBOOK_HANDLERS_ATTR = '_tabnumbers_handler_ids'
+_ORIG_SET_TEXT_ATTR = '_tabnumbers_original_set_text'
+_EDIT_HANDLER_ATTR = '_tabnumbers_edit_handler'
+
 
 def _strip_prefix(text):
-    if not text:
-        return ""
     return NUMBER_PREFIX_RE.sub('', text)
+
+
+def _log_err(context, exc):
+    err('TabNumbers: Error in %s: %s\n%s' %
+        (context, exc, traceback.format_exc()))
 
 
 def _iter_tab_labels(notebook):
@@ -70,14 +78,13 @@ class TabNumbers(plugin.Plugin):
             # Terminator exposes no window-added signal, so wrap register_window
             # to catch new windows without polling.
             self._original_register_window = self.terminator.register_window
-            original = self._original_register_window
 
             def wrapped_register_window(window):
-                original(window)
+                self._original_register_window(window)
                 try:
                     self.process_window(window)
                 except Exception as e:
-                    err('TabNumbers: Error processing new window: %s' % e)
+                    _log_err('processing new window', e)
 
             self.terminator.register_window = wrapped_register_window
 
@@ -85,8 +92,8 @@ class TabNumbers(plugin.Plugin):
                 self.process_window(window)
             dbg('TabNumbers plugin initialized')
         except Exception as e:
-            err('TabNumbers: Error in delayed_init: %s' % e)
-        return False  # don't repeat this idle callback
+            _log_err('delayed_init', e)
+        return False
 
     def process_window(self, window):
         # A Terminator Window's direct child is either a Terminal or a Notebook.
@@ -108,12 +115,12 @@ class TabNumbers(plugin.Plugin):
         # tabs on already-wired notebooks directly. This keeps
         # check_for_new_windows a cheap O(W) walk that only does work for
         # newly-appeared notebooks.
-        if hasattr(notebook, '_tabnumbers_handler_ids'):
+        if hasattr(notebook, _NOTEBOOK_HANDLERS_ATTR):
             return
-        notebook._tabnumbers_handler_ids = [
+        setattr(notebook, _NOTEBOOK_HANDLERS_ATTR, [
             notebook.connect(sig, self.on_tab_event)
             for sig in _NOTEBOOK_SIGNALS
-        ]
+        ])
         dbg('TabNumbers: Connected to notebook signals')
         self.wrap_tab_labels(notebook)
         self.renumber_all_tabs(notebook)
@@ -123,33 +130,46 @@ class TabNumbers(plugin.Plugin):
             self.wrap_editablelabel_set_text(editable_label, page, notebook)
 
     def wrap_editablelabel_set_text(self, editable_label, page, notebook):
-        if hasattr(editable_label, '_tabnumbers_original_set_text'):
+        if hasattr(editable_label, _ORIG_SET_TEXT_ATTR):
             return
 
         original_set_text = editable_label.set_text
-        editable_label._tabnumbers_original_set_text = original_set_text
+        setattr(editable_label, _ORIG_SET_TEXT_ATTR, original_set_text)
 
         # Closure captures `page` so page_num() is an O(1) C-level lookup
-        # instead of a per-update Python scan of every tab.
+        # instead of a per-update Python scan of every tab. One-element
+        # list so the fallback can rebind without `nonlocal`.
+        current_page = [page]
+
         def numbered_set_text(text, force=False):
             raw_text = text if text else ""
             try:
-                page_index = notebook.page_num(page)
+                page_index = notebook.page_num(current_page[0])
                 if page_index < 0:
-                    return original_set_text(raw_text, force=force)
+                    # split_axis() swaps the page widget but reuses this
+                    # EditableLabel via set_tab_label(). Re-resolve by
+                    # label identity and heal the holder so subsequent
+                    # calls take the fast path again.
+                    for p, lbl in _iter_tab_labels(notebook):
+                        if lbl is editable_label:
+                            current_page[0] = p
+                            page_index = notebook.page_num(p)
+                            break
+                    if page_index < 0:
+                        return original_set_text(raw_text, force=force)
                 numbered = NUMBER_FORMAT % (page_index + 1, _strip_prefix(raw_text))
                 # Skip the GTK property set + Pango relayout when unchanged.
                 if numbered == editable_label.get_text():
                     return None
                 return original_set_text(numbered, force=force)
             except Exception as e:
-                err('TabNumbers: Error in wrapped set_text: %s' % e)
+                _log_err('wrapped set_text', e)
                 return original_set_text(raw_text, force=force)
 
         editable_label.set_text = numbered_set_text
 
         handler_id = editable_label.connect('edit-done', self.on_tab_label_edited)
-        editable_label._tabnumbers_edit_handler = handler_id
+        setattr(editable_label, _EDIT_HANDLER_ATTR, handler_id)
         dbg('TabNumbers: Wrapped set_text for EditableLabel')
 
     def on_tab_event(self, notebook, *args):
@@ -158,7 +178,7 @@ class TabNumbers(plugin.Plugin):
             self.renumber_all_tabs(notebook)
             self.check_for_new_windows()
         except Exception as e:
-            err('TabNumbers: Error in on_tab_event: %s' % e)
+            _log_err('on_tab_event', e)
 
     def renumber_all_tabs(self, notebook):
         dbg('TabNumbers: Renumbering %d tabs' % notebook.get_n_pages())
@@ -175,7 +195,7 @@ class TabNumbers(plugin.Plugin):
             # set_text so the wrapper re-applies the number prefix.
             editable_label.set_text(editable_label.get_text(), force=True)
         except Exception as e:
-            err('TabNumbers: Error in on_tab_label_edited: %s' % e)
+            _log_err('on_tab_label_edited', e)
 
     def unload(self):
         try:
@@ -187,30 +207,30 @@ class TabNumbers(plugin.Plugin):
                     self._unwrap_window(window)
             dbg('TabNumbers plugin unloaded')
         except Exception as e:
-            err('TabNumbers: Error during unload: %s' % e)
+            _log_err('unload', e)
 
     def _unwrap_window(self, window):
         if not (hasattr(window, 'is_child_notebook') and window.is_child_notebook()):
             return
         notebook = window.get_child()
-        handler_ids = getattr(notebook, '_tabnumbers_handler_ids', None)
+        handler_ids = getattr(notebook, _NOTEBOOK_HANDLERS_ATTR, None)
         if handler_ids:
             for hid in handler_ids:
                 try:
                     notebook.disconnect(hid)
                 except Exception:
                     pass
-            del notebook._tabnumbers_handler_ids
+            delattr(notebook, _NOTEBOOK_HANDLERS_ATTR)
         for _page, editable_label in _iter_tab_labels(notebook):
-            original = getattr(editable_label, '_tabnumbers_original_set_text', None)
+            original = getattr(editable_label, _ORIG_SET_TEXT_ATTR, None)
             if original is None:
                 continue
-            handler_id = getattr(editable_label, '_tabnumbers_edit_handler', None)
+            handler_id = getattr(editable_label, _EDIT_HANDLER_ATTR, None)
             if handler_id is not None:
                 try:
                     editable_label.disconnect(handler_id)
                 except Exception:
                     pass
-                del editable_label._tabnumbers_edit_handler
+                delattr(editable_label, _EDIT_HANDLER_ATTR)
             editable_label.set_text = original
-            del editable_label._tabnumbers_original_set_text
+            delattr(editable_label, _ORIG_SET_TEXT_ATTR)

@@ -86,6 +86,17 @@ When a new tab is created in Terminator:
    # Handler wraps the new tab's EditableLabel
    ```
 
+### Tab Split Flow (Ctrl+Shift+O / Ctrl+Shift+E)
+
+`Notebook.split_axis()` (`notebook.py` lines 162-215) removes the tab's page
+widget and inserts a new Paned container in its place, then calls
+`set_tab_label(container, label)` with the **same** TabLabel HBox. So the
+TabLabel (and its inner EditableLabel at `tab_label.label`) is **stable**
+across splits — the page widget is **not**. Any code that caches a page
+reference must re-resolve it (e.g. by EditableLabel identity) when
+`notebook.page_num()` returns -1, because no signal fires between
+`remove()` and `set_tab_label()` to prompt re-wrapping.
+
 ### Tab Title Update Flow
 
 Understanding how tab titles update is key to the plugin's design:
@@ -255,6 +266,31 @@ These documents contain:
 - Tab lifecycle flows
 - Testing and debugging techniques
 - Example plugins from Terminator source
+
+## Known Limitations
+
+### First-tab creation in single-Terminal windows
+
+When a Window contains a single Terminal (no Notebook yet) and the user creates
+the first tab, Terminator's `Notebook.__init__` (`notebook.py:26-54`) swaps the
+Window's child from Terminal → Notebook and moves the old Terminal into page 0.
+**No signal we watch fires during this transition**:
+
+- `register_window` runs only when a Window is registered (startup / new window),
+  not when its child changes. The plugin's `register_window` wrapper won't
+  re-invoke here.
+- GTK's `page-added` on the new Notebook fires, but the plugin isn't yet
+  connected to that Notebook's signals, so the handler doesn't run.
+
+The plugin recovers lazily through `check_for_new_windows()` (tab_numbers.py),
+called from `on_tab_event` on any *already-wired* Notebook. In a multi-window
+or multi-tab session this usually heals on the next tab event somewhere in the
+app. In a strict single-window session, the new Notebook stays unnumbered
+until something else triggers a tab event.
+
+This is pre-existing behaviour (not caused by commit 9f9e5a6) and is left as-is:
+a proper fix would need either polling or a deeper hook into Window's child
+changes, neither of which is worth the complexity for this edge case.
 
 ## Compatibility
 
