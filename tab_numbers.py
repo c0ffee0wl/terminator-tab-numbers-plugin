@@ -20,6 +20,7 @@
 import re
 import traceback
 import terminatorlib.plugin as plugin
+import terminatorlib.notebook as notebook_module
 from terminatorlib.terminator import Terminator
 from gi.repository import GObject
 from terminatorlib.util import dbg, err
@@ -49,6 +50,18 @@ def _log_err(context, exc):
         (context, exc, traceback.format_exc()))
 
 
+def _disconnect_and_clear(obj, attr_name):
+    """Disconnect a single handler id stored at obj.attr_name and clear it."""
+    handler_id = getattr(obj, attr_name, None)
+    if handler_id is None:
+        return
+    try:
+        obj.disconnect(handler_id)
+    except Exception:
+        pass
+    delattr(obj, attr_name)
+
+
 def _iter_tab_labels(notebook):
     """Yield (page, editable_label) for each numberable tab in the notebook."""
     for i in range(notebook.get_n_pages()):
@@ -68,6 +81,7 @@ class TabNumbers(plugin.Plugin):
         plugin.Plugin.__init__(self)
         self.terminator = None
         self._original_register_window = None
+        self._original_notebook_init = None
         # Terminator's singleton and windows aren't ready during plugin init;
         # idle_add defers setup until after the GTK main loop is running.
         GObject.idle_add(self.delayed_init)
@@ -76,8 +90,7 @@ class TabNumbers(plugin.Plugin):
         try:
             self.terminator = Terminator()
 
-            # Terminator exposes no window-added signal, so wrap register_window
-            # to catch new windows without polling.
+            # Wrap register_window to catch windows registered after init.
             self._original_register_window = self.terminator.register_window
 
             def wrapped_register_window(window):
@@ -89,6 +102,22 @@ class TabNumbers(plugin.Plugin):
 
             self.terminator.register_window = wrapped_register_window
 
+            # Class-level wrap of Notebook.__init__. This is the one and only
+            # constructor for Notebooks; intercepting it guarantees we catch
+            # the Terminal→Notebook swap on first-tab-creation in a
+            # single-Terminal window, which fires no Terminator-level signal
+            # we can otherwise observe.
+            self._original_notebook_init = notebook_module.Notebook.__init__
+
+            def wrapped_notebook_init(nb, window):
+                self._original_notebook_init(nb, window)
+                # Defer: at this point __init__ has returned but the caller
+                # (Window.tab_new) is still mid-flight inserting the user's
+                # newly-requested tab. idle_add waits for that to settle.
+                GObject.idle_add(self._deferred_setup_notebook, nb)
+
+            notebook_module.Notebook.__init__ = wrapped_notebook_init
+
             for window in self.terminator.windows:
                 self.process_window(window)
             dbg('TabNumbers plugin initialized')
@@ -98,14 +127,21 @@ class TabNumbers(plugin.Plugin):
 
     def process_window(self, window):
         # A Terminator Window's direct child is either a Terminal or a Notebook.
+        # Single-Terminal case is handled via Notebook.__init__ wrap, not here.
         if hasattr(window, 'is_child_notebook') and window.is_child_notebook():
             self.setup_notebook(window.get_child())
 
+    def _deferred_setup_notebook(self, notebook):
+        try:
+            self.setup_notebook(notebook)
+        except Exception as e:
+            _log_err('deferred_setup_notebook', e)
+        return False
+
     def check_for_new_windows(self):
-        # Fallback for the transition where a naked single-Terminal window
-        # gains a Notebook on its first-tab creation — register_window is not
-        # re-invoked for that transition. Only wired to the low-frequency
-        # on_tab_event handler, not to every tab switch.
+        # Defensive walk: setup_notebook is idempotent and cheap when nothing
+        # has changed, so periodic re-checks are a safe heal path if any
+        # window-with-notebook is observed for the first time.
         if self.terminator is None:
             return
         for window in self.terminator.windows:
@@ -213,6 +249,9 @@ class TabNumbers(plugin.Plugin):
 
     def unload(self):
         try:
+            if self._original_notebook_init is not None:
+                notebook_module.Notebook.__init__ = self._original_notebook_init
+                self._original_notebook_init = None
             if self.terminator is not None:
                 if self._original_register_window is not None:
                     self.terminator.register_window = self._original_register_window
@@ -241,12 +280,6 @@ class TabNumbers(plugin.Plugin):
             original = getattr(editable_label, _ORIG_SET_TEXT_ATTR, None)
             if original is None:
                 continue
-            handler_id = getattr(editable_label, _EDIT_HANDLER_ATTR, None)
-            if handler_id is not None:
-                try:
-                    editable_label.disconnect(handler_id)
-                except Exception:
-                    pass
-                delattr(editable_label, _EDIT_HANDLER_ATTR)
+            _disconnect_and_clear(editable_label, _EDIT_HANDLER_ATTR)
             editable_label.set_text = original
             delattr(editable_label, _ORIG_SET_TEXT_ATTR)
