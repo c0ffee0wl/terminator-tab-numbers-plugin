@@ -35,6 +35,7 @@ if not NUMBER_PREFIX_RE.match(NUMBER_FORMAT % (1, '')):
 _NOTEBOOK_SIGNALS = ('page-added', 'page-removed', 'page-reordered')
 
 _NOTEBOOK_HANDLERS_ATTR = '_tabnumbers_handler_ids'
+_NOTEBOOK_PENDING_ATTR = '_tabnumbers_pending'
 _ORIG_SET_TEXT_ATTR = '_tabnumbers_original_set_text'
 _EDIT_HANDLER_ATTR = '_tabnumbers_edit_handler'
 
@@ -173,12 +174,25 @@ class TabNumbers(plugin.Plugin):
         dbg('TabNumbers: Wrapped set_text for EditableLabel')
 
     def on_tab_event(self, notebook, *args):
+        # Defer to idle: Notebook.newtab() emits page-added from inside
+        # insert_page() but only calls set_tab_label() afterwards, so at
+        # signal time the new page's TabLabel isn't attached yet and
+        # _iter_tab_labels would skip it. Running on idle lets newtab()
+        # finish first.
+        if getattr(notebook, _NOTEBOOK_PENDING_ATTR, False):
+            return
+        setattr(notebook, _NOTEBOOK_PENDING_ATTR, True)
+        GObject.idle_add(self._deferred_tab_event, notebook)
+
+    def _deferred_tab_event(self, notebook):
         try:
+            setattr(notebook, _NOTEBOOK_PENDING_ATTR, False)
             self.wrap_tab_labels(notebook)
             self.renumber_all_tabs(notebook)
             self.check_for_new_windows()
         except Exception as e:
-            _log_err('on_tab_event', e)
+            _log_err('deferred_tab_event', e)
+        return False
 
     def renumber_all_tabs(self, notebook):
         dbg('TabNumbers: Renumbering %d tabs' % notebook.get_n_pages())
@@ -221,6 +235,8 @@ class TabNumbers(plugin.Plugin):
                 except Exception:
                     pass
             delattr(notebook, _NOTEBOOK_HANDLERS_ATTR)
+        if hasattr(notebook, _NOTEBOOK_PENDING_ATTR):
+            delattr(notebook, _NOTEBOOK_PENDING_ATTR)
         for _page, editable_label in _iter_tab_labels(notebook):
             original = getattr(editable_label, _ORIG_SET_TEXT_ATTR, None)
             if original is None:
